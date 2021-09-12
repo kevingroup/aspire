@@ -94,7 +94,7 @@ The `run` command does many things:
 Finally, to retrieve the constructed virus genome,
 use the `result` subcommand:
 
-   aspire --job-dir job1 --id vg01 --description "My new genome" > vg01.fasta
+    aspire --job-dir job1 --id vg01 --description "My new genome" > vg01.fasta
 
 Note that the subcommands `run`, `run-pass` are simply convenient
 functions for invoking many other subcommands.
@@ -112,12 +112,13 @@ This is done in 2 steps.
 
 1. Use the `align` command to align the reads to the constructed genomes:
 
-       aspire align --pass all
+        aspire align --pass all
 
 1. Use the `stats` command to gather the results:
 
-       aspire stats alignment-rates > aln-rates.tsv
-       aspire stats mapq > mapq.tsv
+        aspire stats alignment-rates > aln-rates.tsv
+        aspire stats mapq > mapq.tsv
+
 	   
 
 ---
