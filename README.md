@@ -55,6 +55,42 @@ Each subcommand has its own help page, which can be obtained with
 
     aspire --help <subcommand> 
 
+output:
+
+    ASPIRE 1.0 --- ASsembly Pipeline with Iterative REfinement
+    Copyright (C) 2021 LEE Sau Dan <sdlee@cse.cuhk.edu.hk>
+
+    This program comes with ABSOLUTELY NO WARRANTY. This is free
+    software, and you are welcome to redistribute it under certain
+    conditions; see LICENSE, or see <https://www.gnu.org/licenses/>
+
+    aspire [-jmt] [long options...] <command> [opts ...] <args> ...
+            -j STR --job-directory STR  job directory
+            -t INT --threads INT        max number of threads
+                                        (default value: 4)
+            -m INT --memory INT         max memory to use (GB)
+                                        (default value: 64)
+
+    Available commands:
+
+      commands: list the application's commands
+          help: display a command's help screen
+
+         align: Align trimmed reads to constructed genome and compute statistics.
+      assemble: Denovo assembly of trimmed reads.
+       correct: Perform the 'correcting' step of the iterative loop.
+          fill: Perform the 'gap-filling' step of the iterative loop.
+           new: Create a new job.
+        result: Extract constructed genome.
+           run: Run the ASPIRE pipeline.
+      run-pass: Run a single iteration of the iterative loop.
+         stats: Statistics gathered from the 'align' command.
+          tile: Perform the 'tiling' step of the iterative loop.
+          trim: Trim input raw reads.
+       version: display an app's version
+          wrap: Try to wrap a gap-filled genome around (for circular genomes)
+
+
 Suppose you start from gzipped FASTQ files,
 `reads_1.fastq.gz` and `reads_2.fastq.gz`,
 containing paired-end WGS reads for a sample.
