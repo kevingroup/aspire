@@ -55,7 +55,7 @@ Each subcommand has its own help page, which can be obtained with
 
     aspire --help <subcommand> 
 
-Suppose you have start from gzipped FASTQ files,
+Suppose you start from gzipped FASTQ files,
 `reads_1.fastq.gz` and `reads_2.fastq.gz`,
 containing paired-end WGS reads for a sample.
 You would like to construct the virus genome for this sample,
