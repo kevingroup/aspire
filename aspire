@@ -1,0 +1,1915 @@
+#!/usr/bin/perl
+###########################################################################
+# ASPIRE (ASsembly Pipeline with Iterative REfinement)
+# A pipeline for constructing virus-sized genomes out of NGS (short) reads.
+###########################################################################
+#
+# Copyright (C) 2021  LEE Sau Dan <sdlee@cse.cuhk.edu.hk>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+###########################################################################
+
+
+use strict;
+use warnings;
+
+my $result = ASPIRE->new({show_version_cmd => 1})->run;
+exit 1 unless $result;
+
+
+################
+package ASPIRE;
+
+use strict;
+use warnings;
+
+use App::Cmd::Setup -app;
+
+my $usage_banner;
+
+BEGIN {
+    our $VERSION = "1.0";
+    my $copyright = q{Copyright (C) 2021  LEE Sau Dan <sdlee@cse.cuhk.edu.hk>
+
+This program comes with ABSOLUTELY NO WARRANTY.  This is free
+software, and you are welcome to redistribute it under certain
+conditions; see LICENSE, or see <https://www.gnu.org/licenses/>};
+
+    $usage_banner =
+	qq{ASPIRE $VERSION --- ASsembly Pipeline with Iterative REfinement
+$copyright
+};
+}
+
+
+sub _global_option_processing_params {
+    ##WARNING: this hack may break future vesions of App::Cmd
+    my ($self, @args) = @_;
+    my @results = $self->SUPER::_global_option_processing_params(@args);
+
+    my $args = $results[$#results];
+    $args->{show_defaults} = 1;
+    @results;
+}
+
+
+sub usage_desc {
+  my ($self) = @_;
+  my ($command) = $self->command_names;
+qq{$usage_banner
+%c %o <command> [opts ...] <args> ...}
+}
+
+sub global_opt_spec {
+    [ 'job-directory|j=s' => 'job directory' ],
+    [ 'threads|t=i' => 'max number of threads', {
+	default => 4,
+	callbacks => {
+	    positive => \&ASPIRE::Utils::is_positive,
+	}
+      } ],
+    [ 'memory|m=i' => 'max memory to use (GB)', {
+	default => 64,
+	callbacks => {
+	    positive => \&ASPIRE::Utils::is_positive,
+	}
+      } ],
+}
+
+
+sub allow_any_unambiguous_abbrev { 1 }
+
+
+1;
+
+################
+package ASPIRE::Utils;
+
+use strict;
+use warnings;
+use File::Slurp qw(read_file);
+
+use parent qw(Exporter);
+BEGIN{
+    our @EXPORT = qw(is_positive
+		     force_symlink_realpath force_symlink_relative
+		     get_read_count
+		     align get_mapq_histogram compute_MAPQ_stats
+		     run_nucmer);
+}
+
+use File::Spec;
+use Cwd qw(realpath);
+use Bio::DB::Sam;
+use List::Util qw(max);
+use IPC::Run qw(run);
+use File::Slurp qw(write_file);
+use Statistics::Descriptive::Full;
+use Math::Round qw(nhimult);
+
+
+sub is_positive { shift() > 0 }
+
+sub force_symlink_realpath {
+    my ($dest, $link) = @_;
+    unlink($link);
+    symlink(realpath($dest), $link) || die "$link: $!\n";
+}
+
+
+sub force_symlink_relative {
+    my ($dest, $link) = @_;
+    unlink($link);
+    symlink(File::Spec->abs2rel($dest, "$link/.."), $link) ||
+	die "$link: $!\n";
+}
+
+
+sub get_mapq_histogram {
+    my ($bam_file) = @_;
+    my %histogram;
+    my $bam = Bio::DB::Bam->open($bam_file);
+    my $header = $bam->header;
+    while (my $align = $bam->read1) {
+	++$histogram{$align->qual};
+    }
+    return %histogram;
+}
+
+
+sub compute_MAPQ_stats {
+    my ($bam_file, $histogram_file) = @_;
+    my %mapq_histogram = ASPIRE::Utils::get_mapq_histogram($bam_file);
+    my $stat = Statistics::Descriptive::Full->new;
+
+    my @lines;
+    for my $mapq (sort {$a<=>$b} keys %mapq_histogram) {
+	my $count = $mapq_histogram{$mapq};
+	push @lines, "$mapq\t$count\n";
+	$stat->add_data([ ($mapq) x $count ]);
+    }
+
+    write_file($histogram_file, { err_mode => 'croak' }, @lines)
+	if defined $histogram_file;
+
+    return $stat->mean,
+	$stat->quantile(1),
+	$stat->median,
+	$stat->quantile(3);
+}
+
+
+sub align {
+    my ($conf, $basename, $fq1, $fq2) = @_;
+    my $align_threads = max(1, $conf->{threads} - 2);
+    my $sort_mem_gb = max(1, nhimult(1, $conf->{memory}/4));
+    my $index_prefix = $basename;
+    my $bam_file = "$basename.bam";
+
+    run(["bowtie2-build", "$basename.fasta", $index_prefix],
+	'>', "$index_prefix.log") ||
+	die "aspire: bowtie2-build failed with exit status: $?\n";
+
+    run([ "bowtie2",
+	  "--time",
+	  "-p", $align_threads,
+	  "-x", $index_prefix,
+	  "-1", $fq1,
+	  "-2", $fq2 ],
+	'|',
+	[ qw(samtools view -Su -F4 -@ 2) ],
+	'|',
+	[ "samtools", "sort",
+	  "-m", $sort_mem_gb . "G",
+	  "-l", 9,
+	  "-o", $bam_file,
+	  "-@", 2 ]) ||
+	die "aspire: bowtie2/samtools failed with exit status: $?\n";
+
+    run([ "samtools", "index", $bam_file ]) ||
+	die "aspire: 'samtools index' failed with exit status: $?\n";
+}
+
+
+sub get_read_count {
+    my ($fastq_file, $count_cache_file) = @_;
+
+    if (-r $count_cache_file &&  -M $count_cache_file < -M $fastq_file) {
+	my $cached_count = read_file($count_cache_file);
+	return 0+$cached_count if $cached_count =~ m/^\d+$/o;
+    }
+
+    run([ "gzip", "-dc", $fastq_file ],
+	'|',
+	sub {
+	    while (STDIN->getline) {
+	    }
+	    my $lines = STDIN->input_line_number;
+	    die "$fastq_file: number of lines ($lines) is not a multiple of 4!  Truncated?\n"
+		unless $lines % 4 == 0;
+	    print $lines/4, "\n";
+	    STDOUT->close;
+	},
+	'>', \my $read_count) ||
+	die "aspire align: gzip failed with exit status: $?\n";
+
+    chomp $read_count;
+    write_file($count_cache_file, $read_count, "\n");
+    return $read_count;
+}
+
+
+my $nucmer_threading;
+sub run_nucmer {
+    my ($nr_threads, @args) = @_;
+
+    unless (defined $nucmer_threading) {
+	run(["nucmer", "--help"],
+	    '>&', \my $help_message) ||
+	    die "aspire: nucmer: $!\n";
+	$nucmer_threading = $help_message =~ m/--threads/o;
+    }
+
+    my @threads_opt;
+    @threads_opt = ("--threads" => $nr_threads)
+	if $nucmer_threading;
+
+    run(["nucmer", @threads_opt, @args ])
+}
+
+
+1;
+
+################
+package ASPIRE::Command; # abstract parent class
+
+use strict;
+use warnings;
+use App::Cmd::Setup -command;
+
+
+sub global_conf {
+    my ($self) = @_;
+    return $self->{global_conf} if defined $self->{global_conf};
+
+    my $global_opts = $self->{app}->global_options;
+
+    my $job_dir = $global_opts->{job_directory};
+    die "--job-directory <DIR> is missing\n"
+	unless defined $job_dir;
+
+    $self->{global_conf} = {
+	job_dir => $job_dir,
+	threads => $global_opts->threads,
+	memory => $global_opts->memory,
+
+	raw1 => "$job_dir/raw_1.fastq.gz",
+	raw2 => "$job_dir/raw_2.fastq.gz",
+	trimmed1 => "$job_dir/trimmed_1.fastq.gz",
+	trimmed2 => "$job_dir/trimmed_2.fastq.gz",
+	trimmed1_count_cache => "$job_dir/trimmed_1.counts.txt",
+	scaffolds_file => "$job_dir/scaffolds.fa",
+
+	asm_dir => "$job_dir/assembly",
+
+	genome_file => sub {
+	    my $pass = 0+shift;
+	    "$job_dir/genome.$pass.fasta"
+	},
+
+	pass_dir => sub {
+	    my $pass = 0+shift;
+	    "$job_dir/pass.$pass"
+	},
+
+	find_passes => sub {
+	    my $pattern = "$job_dir/pass.*";
+	    my @passes = glob($pattern);
+	    die "$pattern: not found; have you run 'aspire align'?"
+		unless @passes > 0;
+
+	    sort {$a <=> $b} map { m/^.*\.(\d+)$/o; 0+$1 } @passes;
+	},
+    }
+}
+
+
+sub usage_desc {
+  my ($self) = @_;
+
+  my ($command) = $self->command_names;
+  my $usage = qq{$usage_banner
+%c $command %o};
+
+  return $usage unless $self->can('args_desc');
+  $usage . ' ' . $self->args_desc;
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+
+    die "Abstract method being run\n";
+}
+
+
+sub _option_processing_params {
+    ##WARNING: this hack may break future vesions of App::Cmd
+    my ($self, @args) = @_;
+    my @results = $self->SUPER::_option_processing_params(@args);
+
+    return @results, {
+	show_defaults => 1
+    };
+}
+
+
+1;
+
+
+################
+package ASPIRE::Command::new;
+
+use strict;
+use warnings;
+
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+
+    ASPIRE::Utils->import;
+}
+
+
+sub abstract {
+    q{Create a new job.}
+}
+
+sub usage_desc {
+  my ($self) = @_;
+  my ($command) = $self->command_names;
+  qq{%c $command [--raw]\tref_genome.fasta raw_1.fastq.gz raw_2.fastq.gz
+%c $command --trimmed\tref_genome.fasta trimed_1.fastq.gz trimmed_2.fastq.gz
+%c $command --scaffolds\tref_genome.fasta scaffolds.fasta \\
+\ttrimed_1.fastq.gz trimmed_2.fastq.gz}
+}
+
+sub description {
+    q{Create a new job, with given reference genome and input file(s).
+
+With --raw (default), the input files are two *.fastq.gz files
+containing raw, paired-end reads.  A subsequent 'aspire run' will
+perform 'trim', 'assemble' and enter the iterative loop.
+
+With --trimmed, the input files are two *.fastq.gz files containing
+paired-end reads, already trimmed.  A subsequent 'aspire run' will
+skip the 'trim' step and peform an 'assemble' directly, entering the
+iterative loop after that.
+
+With --scaffolds, the input files are a FASTA file containing
+scaffolds from an assembly, followed by two *.fastq.gz files
+containing already trimmed paired-end reads.  A subsequent 'aspire
+run' will go into the interative loop directly, skipping 'trim' and
+'assemble'.
+
+Options:}
+}
+
+sub opt_spec {
+    [ type => [
+	  [ raw => 'Start from raw paired-end reads (default)' ],
+	  [ trimmed   => 'Start from already trimmed paired-end reads' ],
+	  [ scaffolds => 'Start from scaffolds, using trimmed reads to refine the genome iteratively' ],
+      ], {
+	  default => 'raw',
+      }],
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    my $job_dir = $conf->{job_dir};
+    die "$job_dir: already exists\n" if -d $job_dir;
+
+    if ($opts->{type} eq 'scaffolds') {
+	die "expecting 4 arguments, giving the reference genome (FASTA) and the scaffolds (FASTA) and the trimmed paired-end reads (two .fastq.gz files)\n"
+	    unless @$args == 4;
+    } else {
+	die "expecting 3 arguments, giving the reference genome (FASTA) and files for the paired-end reads (.fastq.gz)\n"
+	    unless @$args == 3;
+    }
+
+    for my $file (@$args) {
+	die "$file: not readable" unless -r "$file";
+    }
+}
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    mkdir $conf->{job_dir}
+	|| die "$conf->{job_dir}: cannot create job directory\n";
+
+    my ($ref_genome) = shift @$args;
+    force_symlink_realpath($ref_genome, $conf->{genome_file}->(0));
+
+    my $trimmed = $opts->{trimmed};
+
+    if ($opts->{type} eq 'scaffolds') {
+	my $scaffolds = shift @$args;
+	force_symlink_realpath($scaffolds, $conf->{scaffolds_file});
+	$trimmed = 1;
+    }
+
+    my ($fq1, $fq2) = @$args;
+    force_symlink_realpath($fq1,
+			   $trimmed? $conf->{trimmed1} : $conf->{raw1});
+    force_symlink_realpath($fq2,
+			   $trimmed? $conf->{trimmed2} : $conf->{raw2});
+}
+
+
+1;
+
+
+################
+package ASPIRE::Command::trim;
+
+use strict;
+use warnings;
+use IPC::Run qw(run);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+}
+
+
+sub abstract {
+    q{Trim input raw reads.}
+}
+
+sub description {
+    q{Trim the input raw reads.}
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+    die "$conf->{raw1}: raw reads not readable\n" unless -r $conf->{raw1};
+    die "$conf->{raw2}: raw reads not readable\n" unless -r $conf->{raw2};
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    run('cutadapt',
+	-o => $conf->{trimmed1},
+	-p => $conf->{trimmed2},
+	-a => 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC',
+	-A => 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT',
+	'--cut' => 6,
+	-U => 6,
+	-q => 20,
+	'--trim-n',
+	'--minimum-length' => 70,
+	'--discard-trimmed',
+	$conf->{raw1}, $conf->{raw2})
+	|| die "aspire trim: cutadapt failed\n";
+}
+
+
+1;
+
+
+################
+package ASPIRE::Command::assemble;
+
+use strict;
+use warnings;
+use IPC::Run qw(run);
+use File::Path qw(make_path);
+use List::Util qw(max);
+use Math::Round qw(nhimult);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+
+sub command_names { qw(assemble asm) }
+
+sub abstract {
+    q{Denovo assembly of trimmed reads.}
+}
+
+sub description {
+    q{Denovo assembly of trimmed reads, generating contigs and scaffolds.
+
+By default, ASPIRE uses SPAdes[1] to 'assemble'.
+With --sga, it uses SGA[2] instead.
+
+[1] https://github.com/ablab/spades
+[2] https://github.com/jts/sga
+
+Options:}
+}
+
+sub opt_spec {
+    [ 'sga' => 'Use SGA instead of SPAdes' ]
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+    die "$conf->{trimmed1}: trimmed reads not readable\n"
+	unless -r $conf->{trimmed1};
+    die "$conf->{trimmed2}: trimmed reads not readable\n"
+	unless -r $conf->{trimmed2};
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+    my $asm_dir = $conf->{asm_dir};
+
+    make_path($asm_dir);
+
+    if ($opts->{sga}) {
+	$self->_run_sga;
+    } else {
+	$self->_run_spades;
+    }
+}
+
+sub _run_spades {
+    my ($self) = @_;
+    my $conf = $self->global_conf;
+    my $asm_dir = $conf->{asm_dir};
+
+    run(["spades",
+	 "--careful",
+	 -m => $conf->{memory},
+	 -t => $conf->{threads},
+	 -1 => $conf->{trimmed1},
+	 -2 => $conf->{trimmed2},
+	 -o => $conf->{asm_dir}]) ||
+	die "aspire assembly: spades failed with exit status: $?\n";
+
+    force_symlink_relative($asm_dir."/scaffolds.fasta",
+			   $conf->{scaffolds_file})
+	|| die "$conf->{scaffolds_file}: $!\n";
+}
+
+sub __sga_subcmd {
+    my (@run_args) = @_;
+
+    my $sub_cmd = $run_args[0]->[0];
+    unshift @{$run_args[0]}, "sga";
+
+    run(@run_args) ||
+	die "aspire assembly: 'sga $sub_cmd' failed: $!\n";
+}
+
+sub _run_sga {
+    my ($self) = @_;
+    my $conf = $self->global_conf;
+
+    my $asm_dir = $conf->{asm_dir};
+    my $nr_threads = $conf->{threads};
+    my $preprocessed = "$asm_dir/preprocessed.fastq";
+    my $corrected = "$asm_dir/corrected.fastq";
+    my $filtered = "$asm_dir/filtered.fastq";
+    my $filtered_asqg = "$asm_dir/filtered.asqg.gz";
+    my $merged = "$asm_dir/merged.fasta";
+    my $dedup = "$asm_dir/dedup.fasta";
+    my $dedup_asqg = "$asm_dir/dedup.asqg.gz";
+    my $asm_prefix = "$asm_dir/assembly";
+    my $scaf_prefix = "$asm_dir/scaf";
+    my $scaf_astat = "$scaf_prefix.astat";
+    my $scaffolds_prefix = "$asm_dir/scaffolds";
+    my $scaf = "$scaffolds_prefix.scaf";
+    my $scaf_fasta = "$scaffolds_prefix.fasta";
+
+    __sga_subcmd([qw(preprocess -v),
+		  '--pe-mode' => 1,
+		  '--out' => $preprocessed,
+		  $conf->{trimmed1}, $conf->{trimmed2}]);
+    __sga_subcmd([qw(index -v),
+		  '--threads' => $nr_threads,
+		  '--algorithm' => 'ropebwt',
+		  '--prefix' => $preprocessed,
+		  $preprocessed]);
+
+    __sga_subcmd([qw(correct),
+		  '--threads' => $nr_threads,
+		  '--prefix' => $preprocessed,
+		  "--outfile" => $corrected,
+		  $preprocessed]);
+    __sga_subcmd([qw(index -v),
+		  '--threads' => $nr_threads,
+		  '--algorithm' => 'ropebwt',
+		  '--prefix' => $corrected,
+		  $corrected]);
+
+    __sga_subcmd([qw(filter -v),
+		  '--threads' => $nr_threads,
+		  '--prefix' => $corrected,
+		  '--outfile' => $filtered,
+		  $corrected]);
+
+    __sga_subcmd([qw(overlap -v),
+		  '--threads' => $nr_threads,
+		  '--outfile' => $filtered_asqg,
+		  $filtered]);
+
+    __sga_subcmd([qw(assemble -v),
+		  '--out-prefix' => $asm_prefix,
+		  $filtered_asqg]);
+
+    # don't invoke 'sga-align': its call to 'samtools sort' uses obsolete
+    # command line syntax that doesn't work any more.
+    __run_sga_align($asm_prefix . '-contigs.fa',
+		    $conf->{trimmed1}, $conf->{trimmed2},
+		    $scaf_prefix,
+		    $nr_threads, max(1, nhimult(1, $conf->{memory}/8)));
+
+    run([ "sga-bam2de",
+	  -t => $nr_threads,
+	  '--prefix' => $scaf_prefix,
+	  "$scaf_prefix.bam" ])
+	|| die "aspire assembly: 'sga-bam2de' failed: $!\n";
+
+    run([ "sga-astat",
+	  "$scaf_prefix.bam" ],
+	'>', $scaf_astat)
+	|| die "aspire assembly: 'sga-astat' failed: $!\n";
+
+    __sga_subcmd([qw(scaffold -v),
+		  '--pe' => "$scaf_prefix.de",
+		  '--astatistic-file' => $scaf_astat,
+		  '--outfile', $scaf,
+		  $asm_prefix . '-contigs.fa']);
+
+    __sga_subcmd([qw(scaffold2fasta -v),
+		  '--asqg-file' => $asm_prefix . '-graph.asqg.gz',
+		  '--outfile' => $scaf_fasta,
+		  '--use-overlap',
+		  '--write-unplaced',
+		  $scaf]);
+
+    force_symlink_relative($scaf_fasta,
+			   $conf->{scaffolds_file})
+	|| die "$conf->{scaffolds_file}: $!\n";
+}
+
+sub __run_sga_align {
+    my ($contigs_file, $read1_file, $read2_file,
+	$out_prefix, $nr_threads, $sort_mem_gb) = @_;
+
+    my $sai1_file = $out_prefix . "_1.sai";
+    my $sai2_file = $out_prefix . "_2.sai";
+
+    run([ qw(bwa index),
+	  $contigs_file ])
+   	|| die "aspire assembly: 'bwa index' failed: $!\n";
+
+    run([ qw(bwa aln),
+	  -t => $nr_threads,
+	  $contigs_file,
+	  $read1_file ],
+	'>', $sai1_file)
+   	|| die "aspire assembly: 'bwa aln $read1_file' failed: $!\n";
+    run([ qw(bwa aln),
+	  -t => $nr_threads,
+	  $contigs_file,
+	  $read2_file ],
+	'>', $sai2_file)
+   	|| die "aspire assembly: 'bwa aln $read2_file' failed: $!\n";
+
+    run([ qw(bwa sampe),
+	  $contigs_file,
+	  $sai1_file, $sai2_file,
+	  $read1_file, $read2_file ],
+	'|',
+	[ qw(samtools sort),
+	  -m => $sort_mem_gb . "G",
+	  -o => "$out_prefix.bam" ,
+	  '-' ])
+	|| die "aspire assembly: 'bwa sampe ... | samtools sort ...' failed: $!\n";
+
+    unlink($sai1_file) || die "$sai1_file: $!\n";
+    unlink($sai2_file) || die "$sai2_file: $!\n";
+
+    1;
+}
+
+
+
+1;
+
+################
+package ASPIRE::Command::tile;
+
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use IPC::Run qw(run);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+
+sub abstract {
+    q{Perform the 'tiling' step of the iterative loop.};
+}
+
+sub description {
+    q{Tile scaffolds into a "rough" genome};
+}
+
+sub opt_spec {
+    [ 'pass=i' => 'Which pass? (1, 2, ...)', {
+	required => 1,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      }],
+    [ 'max-gap=i' => "Value to pass to show-tiling's -g option", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ]
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    my $pass = $opts->{pass};
+
+    $self->{in_genome} = my $in_genome = $conf->{genome_file}->($pass - 1);
+    die "$in_genome: not readable; has the last pass finished?\n"
+	unless -r $in_genome;
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+    my $pass = $opts->{pass};
+
+    my $pass_dir = $conf->{pass_dir}->($pass);
+    my $in_genome = "$pass_dir/init_genome.fasta";
+    my $out_genome = "$pass_dir/rough_genome.fasta";
+
+    my $tile_dir = "$pass_dir/tiling";
+    my $prefix = "$tile_dir/genome";
+    my $filter_out_file = "$prefix.filtered.delta";
+    my $tile_out_file = "$prefix.tiling.txt";
+    my $tile_result_file = "$prefix.tiled.fasta",
+
+    make_path($tile_dir);
+
+    force_symlink_relative($self->{in_genome}, $in_genome);
+
+    run_nucmer($conf->{threads},
+	       "--maxmatch",
+	       -b => 4000,
+	       -c => 30,
+	       -p => $prefix,
+	       $in_genome,
+	       $conf->{scaffolds_file}) ||
+	die "aspire tile: nucmer failed with exit status: $?\n";
+
+    run(["delta-filter",
+	 "-q",
+	 "$prefix.delta" ],
+	'>', $filter_out_file) ||
+	die "aspire tile: delta-filter failed with exit status: $?\n";
+
+    run(["show-tiling",
+	 "-c",
+	 "-R",
+	 -g => $opts->{max_gap},
+	 -u => "$prefix.unused_contigs.out",
+	 -p => $tile_result_file,
+	 $filter_out_file ],
+	'>', $tile_out_file) ||
+	die "aspire tile: show-tiling failed with exit status: $?\n";
+
+    force_symlink_relative($tile_result_file, $out_genome);
+}
+
+
+1;
+
+################
+package ASPIRE::Command::correct;
+
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use IPC::Run qw(run);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+use constant {
+    LQ_DELTA => 0.3,
+    MAX_ITERATIONS => 20,
+};
+
+
+sub command_names { qw(correct corr) }
+
+sub abstract {
+    q{Perform the 'correcting' step of the iterative loop.};
+}
+sub description {
+    q{Correct a "rough"/"wrapped" genome into a "gapped" genome.};
+}
+
+sub opt_spec {
+    [ 'pass=i' => 'Which pass? (1, 2, ...)', {
+	required => 1,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      }],
+    [ 'wrap' => 'This is a wrapping pass (input is "wrapped" genome instead of "rough")' ],
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    my $pass = $opts->{pass};
+
+    my $in_type = $opts->{wrap}? "wrapped" : "rough";
+    my $in_genome = $conf->{pass_dir}->($pass) . "/${in_type}_genome.fasta";
+    die "$in_genome: not readable; is --pass correct?  Do you need --wrap?\n"
+	unless -r $in_genome;
+    $self->{in_genome} = $in_genome;
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+    my $pass = $opts->{pass};
+
+    my $pass_dir = $conf->{pass_dir}->($pass);
+    my $corr_dir = "$pass_dir/correcting";
+    my $in_genome = $self->{in_genome};
+    my $out_genome = "$pass_dir/gapped_genome.fasta";
+
+    my $fq1 = "$corr_dir/R1.fastq.gz";
+    my $fq2 = "$corr_dir/R2.fastq.gz";
+    my $log_file = "$corr_dir/correcting.log";
+
+    make_path($corr_dir);
+    force_symlink_relative($conf->{trimmed1}, $fq1);
+    force_symlink_relative($conf->{trimmed2}, $fq2);
+    force_symlink_relative($in_genome, "$corr_dir/genome0.fasta");
+    my $log = IO::File->new($log_file, '>');
+
+    my $prev_lq = 0;
+    for (my $i = 1;; ++$i) {
+	my $basename = "$corr_dir/genome" . ($i - 1);
+	my $newname="$corr_dir/genome$i";
+
+	print $log "iteration $i\n";
+
+	ASPIRE::Utils::align($conf, $basename, $fq1, $fq2);
+
+	my ($mean, $lower_quartile) =
+	    ASPIRE::Utils::compute_MAPQ_stats("$basename.bam");
+	print $log "    mean MAPQ: $mean\n";
+	print $log "    lower quartile of MAPQ: $prev_lq --> $lower_quartile\n";
+
+	my $finish = $lower_quartile - $prev_lq < LQ_DELTA;
+	if ($finish || $i >= MAX_ITERATIONS) {
+	    force_symlink_relative("$basename.fasta", $out_genome);
+	    if ($finish) {
+		print STDERR "aspire correct: done\n";
+	    } else {
+		print STDERR "aspire correct: stopping because of MAX_ITERATIONS\n";
+	    }
+	    last;
+	}
+
+	__call_SNVs($basename);
+	__patch($basename, $newname);
+	print STDERR "aspire correct: done iteration ", $i, "\n";
+
+	$prev_lq = $lower_quartile;
+    }
+}
+
+
+sub __call_SNVs {
+    my ($basename) = @_;
+
+    run([ "samtools", "mpileup",
+	  "--fasta-ref" => "$basename.fasta",
+	  "--redo-BAQ",
+	  "--max-idepth" =>, 1_000_000,
+	  "--max-depth" => 1_000_000,
+	  "--min-MQ" => "20",
+	  "--BCF",
+	  "--output-MQ",
+	  "--output-tags=INFO/AD,INFO/ADF,INFO/ADR,DP,SP",
+	  "$basename.bam" ],
+	'|',
+	[ "bcftools", "call",
+	  "--multiallelic-caller",
+	  "--variants-only",
+	  -O => "u" ],
+	'|',
+	[ "bcftools", "filter",
+	  "--threads" => 2,
+	  -e => 'ALT="." || QUAL<20 || AD[0]+AD[1]<100',
+	  -O => "b",
+	  -o => "$basename.bcf" ]) ||
+	die "aspire correct: subprocess failed with exit status: $?\n";
+
+    run(["bcftools", "index",
+	 "-f",
+	 "$basename.bcf"]) ||
+	die "aspire correct: 'bcftools index' failed with exit status: $?\n";
+}
+
+sub __patch {
+    my ($basename, $newname) = @_;
+
+    run(["bcftools", "consensus",
+	 -e => 'AD[0] >= AD[1]',
+	 "--fasta-ref" => "$basename.fasta",
+	 "$basename.bcf"],
+	'>', "$newname.fasta") ||
+	die "aspire correct: 'bcftools consensus' failed with exit status: $?\n";
+}
+
+
+1;
+
+################
+package ASPIRE::Command::fill;
+
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use IPC::Run qw(run);
+use File::Slurp qw(write_file);
+use Cwd qw(getcwd);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+use constant {
+    FRAGMENT_SIZE => 450,
+    FRAGMENT_SIZE_ERROR => 0.25,
+};
+
+
+sub abstract {
+    q{Perform the 'gap-filling' step of the iterative loop.};
+}
+sub description {
+    q{Fill in the gaps of a "gapped" genome.};
+}
+
+sub opt_spec {
+    [ 'pass=i' => 'Which pass? (1, 2, ...)', {
+	required => 1,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      }],
+}
+
+
+sub validate {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    my $pass = $opts->{pass};
+
+    my $gapped_genome = $conf->{pass_dir}->($pass) . "/gapped_genome.fasta";
+    die "$gapped_genome: not readable; is --pass correct?\n"
+	unless -r $gapped_genome;
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+    my $pass = $opts->{pass};
+
+    my $pass_dir = $conf->{pass_dir}->($pass);
+    my $fill_dir = "$pass_dir/filling";
+    my $in_genome = "$pass_dir/gapped_genome.fasta";
+    my $out_genome = "$pass_dir/filled_genome.fasta";
+
+
+    make_path($fill_dir);
+    force_symlink_relative($conf->{trimmed1}, "$fill_dir/R1.fastq.gz");
+    force_symlink_relative($conf->{trimmed2}, "$fill_dir/R2.fastq.gz");
+    force_symlink_relative("$pass_dir/gapped_genome.fasta",
+			   "$fill_dir/gapped_genome.fasta");
+
+    my $curr_dir = getcwd || die "$!\n";
+    chdir($fill_dir) || die "$fill_dir: !$\n";
+    {
+
+	write_file('library.txt',
+		   "genome bwa R1.fastq.gz R2.fastq.gz " .
+		   FRAGMENT_SIZE . " " . FRAGMENT_SIZE_ERROR . " FR") ||
+	    die "$fill_dir/library.txt: $!\n";
+
+	#note: GapFiller v1.10 seems to have deadlock bugs with multithreading
+	run(["GapFiller",
+	     -l => 'library.txt',
+	     -s => "gapped_genome.fasta",
+	     -T => 1,
+	     -b => "genome",
+	     -t => 0,
+	     -m => 75,
+	     -o => 5,
+	     -r => 0.6,
+	     -i => 50]) ||
+	    die "aspire fill: GapFiller failed with exit status: $?\n";
+    }
+    chdir($curr_dir) || die "$fill_dir: !$\n";
+
+    force_symlink_relative("$fill_dir/genome/genome.gapfilled.final.fa",
+			   $out_genome);
+    force_symlink_relative($out_genome, $conf->{genome_file}->($pass));
+}
+
+
+1;
+
+################
+package ASPIRE::Command::run_pass;
+
+use strict;
+use warnings;
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+sub command_names { "run-pass" }
+
+sub abstract {
+    q{Run a single iteration of the iterative loop.};
+}
+
+sub args_desc { "<pass>" }
+
+sub description {
+    q{Run the commands 'tile', 'correct' and 'fill' in that order, with --pass=<pass>.
+
+If '--wrap', then do a 'wrap' instead of 'tile' and stop immediately if the wrapping failed to generate a new genome.
+
+Options:};
+}
+
+sub opt_spec {
+    [ 'wrap' => 'This is a wrapping pass (first step is "wrap" instead of "tile")' ],
+    [ 'max-gap=i' => "Value to pass to 'tile'", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ],
+    [ 'min-shift=i' => "Value to pass to 'wrap'", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ],
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+    my $app = $self->app;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    $self->usage_error("This command accepts exactly 1 argument.\n")
+	unless @$args == 1;
+
+    my $pass = $args->[0];
+    die "invalid pass: $pass\n"
+	unless $pass > 0;
+
+    my $wrap = $opts->{wrap};
+
+    my @commands = (($wrap? "wrap" : "tile"), "correct", "fill");
+    for my $name (@commands) {
+	my ($cmd) = "ASPIRE::Command::$name"->prepare($app, qw(--pass 99));
+	$self->{$name} = $cmd;
+    }
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+    my $app = $self->{app};
+    my $wrap = $opts->{wrap};
+    my $pass = $args->[0];
+
+    my $cmd;
+
+    # either tile or wrap
+    if (!$wrap) {
+	$app->execute_command($self->{tile}, {
+	    pass => $pass,
+	    max_gap => $opts->{max_gap},
+        });
+    } else {
+	my $result = $app->execute_command($self->{wrap}, {
+	    pass => $pass,
+	    min_shift => $opts->{min_shift},
+	});
+
+	unless ($result) { # no wrapping...
+	    unlink $conf->{genome_file}->($pass);
+	    return 0;
+	}
+    }
+
+    my $corr_opts = { pass => $pass };
+    $corr_opts->{wrap} = 1 if $wrap;
+    $app->execute_command($self->{correct}, $corr_opts);
+
+    $app->execute_command($self->{fill}, { pass => $pass });
+
+    return 1; # success
+}
+
+
+1;
+
+################
+package ASPIRE::Command::wrap;
+
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Slurp qw(write_file append_file);
+use IPC::Run qw(run);
+use Bio::SeqIO;
+use Bio::Seq;
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+sub abstract {
+    q{Try to wrap a gap-filled genome around (for circular genomes)};
+}
+sub description {
+    q{Try to wrap a gap-filled genome around to match the reference genome better.  This should only be used for circular genomes.  Fails if no wrapping is needed.};
+}
+
+sub opt_spec {
+    [ 'pass=i' => 'Which pass? (1, 2, ...)', {
+	required => 1,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      }],
+    [ 'min-shift=i' => "Don't wrap if the genome shifts (w.r.t. reference) by less than this # of bp", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ]
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    my $pass = $opts->{pass};
+
+    $self->{in_genome} = my $in_genome = $conf->{genome_file}->($pass - 1);
+    die "$in_genome: not readable; has the last pass finished?\n"
+	unless -r $in_genome;
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+    my $pass = $opts->{pass};
+
+    my $pass_dir = $conf->{pass_dir}->($pass);
+    my $wrap_dir = "$pass_dir/wrapping";
+    my $in_genome = "$pass_dir/init_genome.fasta";
+    my $out_genome = "$pass_dir/wrapped_genome.fasta";
+    my $out_prefix="$wrap_dir/genome";
+    my $out_fasta = "$wrap_dir/wrapped.fasta";
+    my $log_file="$wrap_dir/wrapping.log";
+
+    make_path($wrap_dir);
+    force_symlink_relative($self->{in_genome}, $in_genome);
+    force_symlink_relative($in_genome, "$wrap_dir/unwrapped.fasta");
+
+    run_nucmer($conf->{threads},
+	       "--maxmatch",
+	       -p => $out_prefix,
+	       $conf->{genome_file}->(0),
+	       $in_genome) ||
+	die "aspire wrap: nucmer failed with exit status: $?\n";
+
+    run(["show-coords",
+	 "-T",
+	 "$out_prefix.delta"],
+	'|',
+	sub {
+	    while (my $line = STDIN->getline) {
+		my $n = STDIN->input_line_number;
+		if ($n == 4) {
+		    my @cols = split("\t", $line);
+		    die "Unexpected format in output of MUMmer show-coords\n"
+			unless ($cols[0] eq '[S1]' &&
+				$cols[2] eq '[S2]')
+		} elsif ($n == 5) {
+		    my @fields = split("\t", $line);
+		    my ($S1, $S2) = @fields[(0, 2)];
+		    my $delta = $S2 - $S1;
+		    write_file($log_file, "delta=$delta\n");
+		    print $delta, "\n";
+		}
+	    }
+	    STDOUT->close;
+	},
+	'>', \my $delta) ||
+	die "aspire wrap: show-coords failed with exit status: $?\n";
+
+    chomp $delta;
+    print STDERR "aspire wrap: delta=$delta\n";
+    if (abs($delta) < $opts->{min_shift}) {
+	my $message = "not wrapping because shift==$delta < MIN_SHIFT=$opts->{min_shift}\n";
+	append_file($log_file, $message);
+	unlink($out_fasta);
+
+	print STDERR "aspire wrap: $message";
+	return 0;
+    }
+
+    __wrap_fasta($in_genome, $delta, $out_fasta);
+    force_symlink_relative($out_fasta, $out_genome);
+}
+
+
+sub __wrap_fasta {
+    my ($in_file, $delta, $out_file) = @_;
+
+    my $in_fasta = Bio::SeqIO->new(-file => "$in_file",
+				   -format => 'FASTA');
+    my $out_fasta = Bio::SeqIO->new(-file => ">$out_file",
+				    -format => 'FASTA');
+
+    while (my $in_seq = $in_fasta->next_seq) {
+	my $seq = $in_seq->seq;
+	my $seq_name = $in_seq->display_id;
+
+	# This works for both +ve and -ve $curr_start  ;)
+	my $seq2 = substr($seq, $delta) . 'n' .
+	    substr($seq, 0, $delta);
+
+	my $out_seq = Bio::Seq->new(-display_id => $seq_name,
+				    -seq => $seq2);
+
+	$out_fasta->write_seq($out_seq);
+    }
+}
+
+
+1;
+
+################
+package ASPIRE::Command::align;
+
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use IPC::Run qw(run);
+use File::Slurp qw(write_file);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+
+sub abstract {
+    qq{Align trimmed reads to constructed genome and compute statistics.};
+}
+sub description {
+    qq{Align trimmed reads to constructed genome and compute statistics.
+Note that you can use '--pass=0' to obtain the statistics for the
+reference genome.
+
+Use '--pass=all' to automatically run 'align' on all successful passes
+found.  This is done one pass after another, sequentially, though,
+even if you use '--threads=<n>', because the --threads option only
+tells the called programs to run on multiple cores, not ASPIRE itself.
+
+Options:
+};
+}
+
+sub opt_spec {
+    [ 'pass=s' => 'Which pass? (0, 1, 2, ... or "all")', { required => 1 }],
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "This command takes no arguments.\n"
+	unless @$args == 0;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    my $pass = $opts->{pass};
+    return if $pass eq 'all';
+
+    die "invalid pass: $pass\n"
+	unless $pass =~ m/^\d+$/o;
+
+    my $genome = $conf->{genome_file}->($pass);
+    die "$genome: not readable; is --pass correct?\n"
+	unless -r $genome;
+}
+
+
+sub execute {
+    my ($self, $opts, @args) = @_;
+    my $pass = $opts->{pass};
+
+    return $self->_do_all_passes($opts) if $pass eq 'all';
+
+    $self->_do_one_pass($opts);
+}
+
+sub _do_one_pass {
+    my ($self, $opts) = @_;
+    my $conf = $self->global_conf;
+    my $pass = $opts->{pass};
+
+    my $pass_dir = $conf->{pass_dir}->($pass);
+    my $align_dir = "$pass_dir/aligning";
+    my $aln_counts_file = "$pass_dir/alignment.counts.txt";
+    my $mapq_stats_file = "$pass_dir/mapq.stats.txt";
+
+    my $fq1 = "$align_dir/R1.fastq.gz";
+    my $fq2 = "$align_dir/R2.fastq.gz";
+    my $prefix = "$align_dir/genome";
+    my $out_mapq = "$align_dir/mapq.txt";
+    my $out_mapq_summary = "$align_dir/mapq.summary.txt";
+    my $out_counts = "$align_dir/read.counts.txt";
+
+    unlink $aln_counts_file;
+    unlink $mapq_stats_file;
+
+    make_path($align_dir);
+    force_symlink_relative($conf->{trimmed1}, $fq1);
+    force_symlink_relative($conf->{trimmed2}, $fq2);
+    force_symlink_relative($conf->{genome_file}->($pass), "$prefix.fasta");
+
+    align($conf, $prefix, $fq1, $fq2);
+
+    my $read_count = #assume: $fq2 have same count
+	ASPIRE::Utils::get_read_count($fq1, $conf->{trimmed1_count_cache})*2;
+    my ($mapped, $properly_paired) =
+	__compute_alignment_counts("$prefix.bam", 30);
+    write_file($out_counts, { err_mode => 'croak' },
+	       "$mapped\t$properly_paired\n");
+    force_symlink_relative($out_counts, $aln_counts_file);
+    print "single end mapping rate: ", $mapped / $read_count, "\n";
+    print "proper pair mapping rate: ", $properly_paired / $read_count, "\n";
+
+    my @mapq_summary =
+	ASPIRE::Utils::compute_MAPQ_stats("$prefix.bam", $out_mapq);
+    write_file($out_mapq_summary, { err_mode => 'croak' },
+	       join("\t", @mapq_summary) . "\n");
+    force_symlink_relative($out_mapq_summary, $mapq_stats_file);
+    print "MAPQ: mean=$mapq_summary[0] lower_quartile=$mapq_summary[1] median=$mapq_summary[2] upper_quartile=$mapq_summary[3]\n";
+
+    return 1;
+}
+
+sub _do_all_passes {
+    my ($self, $opts, @args) = @_;
+    my $conf = $self->global_conf;
+
+    my @passes = $conf->{find_passes}->();
+    @passes = (0, grep { $_ > 0 } @passes);
+    @passes = grep { -r $conf->{genome_file}->($_) } @passes;
+
+    for my $pass (@passes) {
+	$opts->{pass} = $pass;
+	print STDERR "Running: aspire align --pass=$pass\n";
+	$self->_do_one_pass($opts) ||
+	    die "aspire align --pass=all aborted at pass #$pass\n";
+    }
+
+    return 1;
+}
+
+
+sub __compute_alignment_counts {
+    my ($bam_file, $min_mapq) = @_;
+
+    run([ "samtools", "view",
+	  "-u",
+	  -q => $min_mapq,
+	  $bam_file ],
+	'|',
+	[ qw(samtools flagstat -) ],
+	'|',
+	sub {
+	    my $mapped = 0;
+	    my $properly_paired = 0;
+
+	    while (my $line = STDIN->getline) {
+		if ($line =~ m/^(\d+) .* mapped \(/) {
+		    $mapped = $1;
+		} elsif ($line =~ m/^(\d+) .* with itself and mate mapped$/) {
+		    $properly_paired = $1;
+		}
+	    }
+
+	    print "$mapped\t$properly_paired\n";
+	    STDOUT->close;
+	},
+	'>', \my $counts) ||
+	die "aspire align: samtools failed with exit status: $?\n";
+
+    chomp $counts;
+    return split("\t", $counts);
+}
+
+
+1;
+
+################
+package ASPIRE::Command::stats;
+
+use strict;
+use warnings;
+use File::Slurp qw(read_file);
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+}
+
+
+sub abstract {
+    qq{Statistics gathered from the 'align' command.};
+}
+
+sub args_desc { "{alignment-rates|ar|mapq}" }
+
+sub opt_spec {
+    [ 'no-header|H' => 'Omit header line' ],
+}
+
+sub description {
+    qq{Statistics gathered from the 'align' command.
+With subcommand 'alignment-rates' (or 'ar'), alignment rates are shown.
+With subcommand 'mapq', mapping quality summary statistics are shown.
+};
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    $self->usage->die unless @$args == 1;
+    my $subcmd = $args->[0];
+
+    die "bad subcommand: $subcmd\n"
+	unless $subcmd =~ m{^ar|alignment-rates|mapq$}o;
+
+    $self->{no_header} = $opts->{no_header};
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+
+    my $subcmd = $args->[0];
+    if ($subcmd eq 'ar' || $subcmd eq 'alignment-rates') {
+	$self->_alignment_rates;
+    } elsif ($subcmd eq 'mapq') {
+	$self->_mapq_stats;
+    } else {
+	die "bug!";
+    }
+    return 1;
+}
+
+
+sub _alignment_rates {
+    my ($self) = @_;
+    my $conf = $self->global_conf;
+    my @passes = $conf->{find_passes}->();
+
+    my $total_count = #assume: $fq2 have same count
+	ASPIRE::Utils::get_read_count($conf->{trimmed1},
+				      $conf->{trimmed1_count_cache})*2;
+
+    local ($, , $\) = ("\t", "\n");
+    print qw(pass mapped paired) unless $self->{no_header};
+    for my $pass (@passes) {
+	my $pass_dir = $conf->{pass_dir}->($pass);
+	my $file =  "$pass_dir/alignment.counts.txt";
+
+	unless (-r $file) {
+	    next unless -r $conf->{genome_file}->($pass); # OK; don't warn
+	    warn "$file: not readable; have you called 'aspire align' for this pass yet?\n";
+	    next;
+	}
+
+	my @lines = read_file($file);
+	die "$file: file contains no lines\n" unless @lines > 0;
+
+	my ($mapped, $paired) = split("\t", $lines[0]);
+	die "$file: unexpected contents: $lines[0]\n"
+	    unless defined($paired);
+
+	print $pass, $mapped/$total_count, $paired/$total_count;
+    }
+}
+
+sub _mapq_stats {
+    my ($self) = @_;
+    my $conf = $self->global_conf;
+    my @passes = $conf->{find_passes}->();
+
+    local ($, , $\) = ("\t", "\n");
+    print qw(pass mean lower_quartile median upper_quartile)
+	unless $self->{no_header};
+    for my $pass (@passes) {
+	my $pass_dir = $conf->{pass_dir}->($pass);
+	my $file = "$pass_dir/mapq.stats.txt";
+
+	unless (-r $file) {
+	    next unless -r $conf->{genome_file}->($pass); # OK; don't warn...
+	    warn "$file: not readable; have you called 'aspire align' for this pass yet?\n";
+	    next;
+	}
+
+	my @lines = read_file($file);
+	die "$file: file contains no lines\n" unless @lines > 0;
+
+	my ($mean, $lq, $median, $uq) = split("\t", $lines[0]);
+	die "$file: unexpected contents: $lines[0]\n"
+	    unless defined($uq);
+	chomp $uq;
+
+	print $pass, $mean, $lq, $median, $uq;
+    }
+}
+
+1;
+
+################
+package ASPIRE::Command::result;
+
+use strict;
+use warnings;
+
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+
+sub abstract {
+    qq{Extract constructed genome.};
+}
+
+sub opt_spec {
+    [ 'pass=i' => 'Which pass? (1, 2, ...)', {
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      }],
+    [ 'id=s' => 'sequence id to use in the output' ],
+    [ 'description=s' => 'sequence description to use the output' ],
+}
+
+sub description {
+    qq{Extract constructed genome to stdout in FASTA format.
+
+The genome extracted is the result of the last successful pass of the iterative loop (see 'run-pass').  If '--pass <pass>' is specified, however, the result of an intermediate pass will be retrieved instead.
+
+The resulting .fasta file will start with a description line (defline), which consists of '>' followed by the sequence id and description specified by the --id and --description options.  If not specified, an arbitrary id (depending on the underlying tools) is used without description in the defline.
+
+Options:
+};
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    $self->usage_error("This command takes no arguments")
+	unless @$args == 0;
+
+    my $id = $opts->{id};
+    if (defined $id) {
+	die "Sequence id should not contain whitespace characters.\n"
+	    unless $id =~ m/^[^[:space:]]+$/o;
+    }
+
+    my $desc = $opts->{description};
+    if (defined $desc) {
+	die "Sequence description should not contain TAB, LF or CR characters.\n"
+	    if $desc =~ m/[\t\n\r]/o;
+    }
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+
+    my $pass = $opts->{pass};
+    my $file;
+    if (defined $pass) {
+	$file = $conf->{genome_file}->($pass);
+	die "No result for pass $pass found.  Did that pass run successful?\n"
+	    unless -r $file;
+    } else { # look for last successful pass
+	my @pass = $conf->{find_passes}->();
+	die "No passes of the iterative loop found.  Have you ever run 'run-pass'?\n"
+	    unless @pass > 0;
+	for my $p (sort {$b<=>$a} @pass) { # descending order
+	    $file = $conf->{genome_file}->($p);
+	    if (-r $file) {
+		$pass = $p;
+		last;
+	    }
+	}
+	die "No successful pass of the iterative loop found.\n"
+	    unless defined $pass;
+
+	print STDERR "Extracting from pass $pass\n";
+    }
+
+    __extract_fasta($file, $opts->{id}, $opts->{description});
+
+    1;
+}
+
+
+sub __extract_fasta {
+    my ($in_file, $id, $description) = @_;
+
+    my $in_fasta = Bio::SeqIO->new(-file => "$in_file",
+				   -format => 'FASTA');
+    my $out_fasta = Bio::SeqIO->new(-fh => \*STDOUT,
+				    -format => 'FASTA');
+
+    while (my $in_seq = $in_fasta->next_seq) {
+	my $seq = $in_seq->seq;
+	my $in_id = $in_seq->display_id;
+
+	my $out_id = $id // $in_id;
+	my $out_seq;
+	if (!defined $description) {
+	    $out_seq = Bio::Seq->new(-display_id => $out_id,
+				     -seq => $seq);
+	} else {
+	    $out_seq = Bio::Seq->new(-display_id => $out_id,
+				     -description => $description,
+				     -seq => $seq);
+	}
+
+	$out_fasta->write_seq($out_seq);
+    }
+}
+
+1;
+
+################
+package ASPIRE::Command::run;
+
+use strict;
+use warnings;
+BEGIN {
+    our @ISA = qw(ASPIRE::Command);
+    ASPIRE::Utils->import;
+}
+
+sub abstract {
+    q{Run the ASPIRE pipeline.};
+}
+
+sub args_desc { "<nr_passes>" }
+
+sub description {
+    q{Run the ASPIRE pipeline, namely 'trim', 'assemble' and then multiple
+passes through the iterative loop ('run-pass').  The number of
+<nr_passes> is given on the command line.
+
+If '--wrap', then do an additional 'wrapping' pass (as the
+(<nr_passes>+1)-th pass).
+
+The results can then be retrieved with the 'result' command.
+Statistics can be gathered with 'stats', aftering running
+'align --pass <pass>' for each pass.
+
+Options:};
+}
+
+sub opt_spec {
+    [ 'sga' => q{Use SGA instead of SPAdes for 'assemble'} ],
+    [ 'wrap' => 'Do an additional wrapping pass' ],
+    [ 'max-gap=i' => "Value to pass to 'tile'", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ],
+    [ 'min-shift=i' => "Value to pass to 'wrap'", {
+	default => 1000,
+	callbacks => {
+	    positive => \&is_positive,
+	}
+      } ],
+}
+
+sub validate_args {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+    my $app = $self->app;
+
+    die "$conf->{job_dir}: no such job directory\n"
+	unless -d $conf->{job_dir};
+
+    $self->usage_error("This command accepts exactly 1 argument.\n")
+	unless @$args == 1;
+
+    my $passes = $args->[0];
+    die "invalid number of passes: $passes\n"
+	unless $passes > 0;
+
+    my @commands = qw(trim assemble run_pass);
+    for my $name (@commands) {
+	my $cmd;
+	if ($name eq 'run_pass') {
+	    ($cmd) = "ASPIRE::Command::$name"->prepare($app, qw(--pass 99));
+	} else {
+	    ($cmd) = "ASPIRE::Command::$name"->prepare($app);
+	}
+	$self->{$name} = $cmd;
+    }
+}
+
+
+sub execute {
+    my ($self, $opts, $args) = @_;
+    my $conf = $self->global_conf;
+    my $app = $self->app;
+    my $passes = $args->[0];
+
+    my $cmd;
+
+    $self->_make_scaffolds($opts);
+
+    for my $p (1 .. $passes) {
+	$app->execute_command($self->{"run_pass"}, {
+	    max_gap => $opts->{max_gap},
+        }, $p) ||
+	    die "aspire run aborted: pass $p failed!\n";
+    }
+
+    if ($opts->{wrap}) {
+	my $result = $app->execute_command($self->{"run_pass"}, {
+	    wrap => 1,
+	    min_shift => $opts->{min_shift},
+	}, 1+$passes);
+	warn "apsire run: wrapping was not successful.\n"
+	    unless $result;
+    }
+
+    return 1; # success
+}
+
+sub _make_scaffolds {
+    my ($self, $opts) = @_;
+    my $conf = $self->global_conf;
+
+    return 1 if -r $conf->{scaffolds_file}; # already done
+
+    # need to assemble
+    my $app = $self->app;
+
+    $self->_make_trimmed;
+
+    my %opts;
+    $opts{sga} = 1 if $opts->{sga};
+
+    $app->execute_command($self->{assemble}, \%opts) ||
+	die "aspire run aborted: 'assemble' failed\n";
+}
+
+sub _make_trimmed {
+    my ($self) = @_;
+    my $conf = $self->global_conf;
+
+    return 1 if -r $conf->{trimmed1} && -r $conf->{trimmed2}; # already done
+
+    # need to trim
+    my $app = $self->app;
+
+    $app->execute_command($self->{trim}) ||
+	die "aspire run aborted: 'trim' failed\n";
+}
+
+1;
+
+#end
